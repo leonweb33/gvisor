@@ -2222,10 +2222,8 @@ type fragmentationTestCase struct {
 	mtu           uint32
 	gso           *stack.GSO
 	transHdrLen   int
-	extraHdrLen   int
 	payloadSize   int
 	wantFragments []fragmentInfo
-	expectedFrags int
 }
 
 var fragmentationTests = []fragmentationTestCase{
@@ -2234,7 +2232,6 @@ var fragmentationTests = []fragmentationTestCase{
 		mtu:         1280,
 		gso:         &stack.GSO{},
 		transHdrLen: 0,
-		extraHdrLen: header.IPv6MinimumSize,
 		payloadSize: 1000,
 		wantFragments: []fragmentInfo{
 			{offset: 0, payloadSize: 1000, more: false},
@@ -2245,7 +2242,6 @@ var fragmentationTests = []fragmentationTestCase{
 		mtu:         1280,
 		gso:         &stack.GSO{},
 		transHdrLen: 0,
-		extraHdrLen: header.IPv6MinimumSize,
 		payloadSize: 2000,
 		wantFragments: []fragmentInfo{
 			{offset: 0, payloadSize: 1240, more: true},
@@ -2257,7 +2253,6 @@ var fragmentationTests = []fragmentationTestCase{
 		mtu:         2000,
 		gso:         &stack.GSO{},
 		transHdrLen: 100,
-		extraHdrLen: header.IPv6MinimumSize,
 		payloadSize: 1000,
 		wantFragments: []fragmentInfo{
 			{offset: 0, payloadSize: 1100, more: false},
@@ -2268,7 +2263,6 @@ var fragmentationTests = []fragmentationTestCase{
 		mtu:         1280,
 		gso:         nil,
 		transHdrLen: 0,
-		extraHdrLen: header.IPv6MinimumSize,
 		payloadSize: 1400,
 		wantFragments: []fragmentInfo{
 			{offset: 0, payloadSize: 1240, more: true},
@@ -2280,23 +2274,10 @@ var fragmentationTests = []fragmentationTestCase{
 		mtu:         1280,
 		gso:         &stack.GSO{},
 		transHdrLen: 100,
-		extraHdrLen: header.IPv6MinimumSize,
 		payloadSize: 1200,
 		wantFragments: []fragmentInfo{
 			{offset: 0, payloadSize: 1240, more: true},
 			{offset: 154, payloadSize: 76, more: false},
-		},
-	},
-	{
-		description: "Fragmented with big header and prependable bytes",
-		mtu:         1280,
-		gso:         &stack.GSO{},
-		transHdrLen: 20,
-		extraHdrLen: header.IPv6MinimumSize + 66,
-		payloadSize: 1500,
-		wantFragments: []fragmentInfo{
-			{offset: 0, payloadSize: 1240, more: true},
-			{offset: 154, payloadSize: 296, more: false},
 		},
 	},
 }
@@ -2310,7 +2291,7 @@ func TestFragmentation(t *testing.T) {
 
 	for _, ft := range fragmentationTests {
 		t.Run(ft.description, func(t *testing.T) {
-			pkt := testutil.MakeRandPkt(ft.transHdrLen, ft.extraHdrLen, []int{ft.payloadSize}, header.IPv6ProtocolNumber)
+			pkt := testutil.MakeRandPkt(ft.transHdrLen, header.IPv6MinimumSize, []int{ft.payloadSize}, header.IPv6ProtocolNumber)
 			source := pkt.Clone()
 			ep := testutil.NewMockLinkEndpoint(ft.mtu, nil, math.MaxInt32)
 			r := buildRoute(t, ep)
@@ -2331,10 +2312,8 @@ func TestFragmentation(t *testing.T) {
 			if got := r.Stats().IP.OutgoingPacketErrors.Value(); got != 0 {
 				t.Errorf("got r.Stats().IP.OutgoingPacketErrors.Value() = %d, want = 0", got)
 			}
-			if len(ep.WrittenPackets) > 0 {
-				if err := compareFragments(ep.WrittenPackets, source, ft.mtu, ft.wantFragments, tcp.ProtocolNumber); err != nil {
-					t.Error(err)
-				}
+			if err := compareFragments(ep.WrittenPackets, source, ft.mtu, ft.wantFragments, tcp.ProtocolNumber); err != nil {
+				t.Error(err)
 			}
 		})
 	}
@@ -2378,7 +2357,7 @@ func TestFragmentationWritePackets(t *testing.T) {
 					for i := 0; i < test.insertBefore; i++ {
 						pkts.PushBack(tinyPacket.Clone())
 					}
-					pkt := testutil.MakeRandPkt(ft.transHdrLen, ft.extraHdrLen, []int{ft.payloadSize}, header.IPv6ProtocolNumber)
+					pkt := testutil.MakeRandPkt(ft.transHdrLen, header.IPv6MinimumSize, []int{ft.payloadSize}, header.IPv6ProtocolNumber)
 					source := pkt
 					pkts.PushBack(pkt.Clone())
 					for i := 0; i < test.insertAfter; i++ {
@@ -2467,7 +2446,7 @@ func TestFragmentationErrors(t *testing.T) {
 			wantError:      tcpip.ErrAborted,
 		},
 		{
-			description:    "Error on packet with MTU smaller than transport header",
+			description:    "Error when MTU is smaller than transport header",
 			mtu:            1280,
 			transHdrLen:    1500,
 			payloadSize:    500,
@@ -2475,6 +2454,16 @@ func TestFragmentationErrors(t *testing.T) {
 			outgoingErrors: 1,
 			mockError:      nil,
 			wantError:      tcpip.ErrMessageTooLong,
+		},
+		{
+			description:    "Error when MTU is smaller than IPv6 minimum MTU",
+			mtu:            header.IPv6MinimumMTU - 1,
+			transHdrLen:    0,
+			payloadSize:    500,
+			allowPackets:   0,
+			outgoingErrors: 1,
+			mockError:      nil,
+			wantError:      tcpip.ErrInvalidEndpointState,
 		},
 	}
 
