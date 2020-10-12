@@ -78,6 +78,8 @@ type threadPool struct {
 	// be the tracer for the given *thread, and therefore capable of using
 	// relevant ptrace calls.
 	threads map[int32]*thread
+
+	rpc chan SyscallRPC
 }
 
 // lookupOrCreate looks up a given thread or creates one.
@@ -89,21 +91,6 @@ func (tp *threadPool) lookupOrCreate(currentTID int32, newThread func() *thread)
 	tp.mu.Lock()
 	t, ok := tp.threads[currentTID]
 	if !ok {
-		// Before creating a new thread, see if we can find a thread
-		// whose system tid has disappeared.
-		//
-		// TODO(b/77216482): Other parts of this package depend on
-		// threads never exiting.
-		for origTID, t := range tp.threads {
-			// Signal zero is an easy existence check.
-			if err := syscall.Tgkill(syscall.Getpid(), int(origTID), 0); err != nil {
-				// This thread has been abandoned; reuse it.
-				delete(tp.threads, origTID)
-				tp.threads[currentTID] = t
-				tp.mu.Unlock()
-				return t
-			}
-		}
 
 		// Create a new thread.
 		t = newThread()
@@ -141,16 +128,6 @@ type subprocess struct {
 // The create function will be called in the latter case, which is guaranteed
 // to happen with the runtime thread locked.
 func newSubprocess(create func() (*thread, error)) (*subprocess, error) {
-	// See Release.
-	globalPool.mu.Lock()
-	if len(globalPool.available) > 0 {
-		sp := globalPool.available[len(globalPool.available)-1]
-		globalPool.available = globalPool.available[:len(globalPool.available)-1]
-		globalPool.mu.Unlock()
-		return sp, nil
-	}
-	globalPool.mu.Unlock()
-
 	// The following goroutine is responsible for creating the first traced
 	// thread, and responding to requests to make additional threads in the
 	// traced process. The process will be killed and reaped when the
@@ -159,7 +136,7 @@ func newSubprocess(create func() (*thread, error)) (*subprocess, error) {
 	requests := make(chan chan *thread)
 	go func() { // S/R-SAFE: Platform-related.
 		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
+		//	defer runtime.UnlockOSThread()
 
 		// Initialize the first thread.
 		firstThread, err := create()
@@ -197,9 +174,6 @@ func newSubprocess(create func() (*thread, error)) (*subprocess, error) {
 			// Return the thread.
 			r <- t
 		}
-
-		// Requests should never be closed.
-		panic("unreachable")
 	}()
 
 	// Wait until error or readiness.
@@ -207,6 +181,7 @@ func newSubprocess(create func() (*thread, error)) (*subprocess, error) {
 		return nil, err
 	}
 
+	syscallRPC := make(chan SyscallRPC)
 	// Ready.
 	sp := &subprocess{
 		requests: requests,
@@ -215,9 +190,11 @@ func newSubprocess(create func() (*thread, error)) (*subprocess, error) {
 		},
 		syscallThreads: threadPool{
 			threads: make(map[int32]*thread),
+			rpc:     syscallRPC,
 		},
 		contexts: make(map[*context]struct{}),
 	}
+	go sp.syscallLoop(syscallRPC)
 
 	sp.unmap()
 	return sp, nil
@@ -245,6 +222,9 @@ func (s *subprocess) unmap() {
 func (s *subprocess) Release() {
 	go func() { // S/R-SAFE: Platform.
 		s.unmap()
+		close(s.syscallThreads.rpc)
+		close(s.requests)
+		return
 		globalPool.mu.Lock()
 		globalPool.available = append(globalPool.available, s)
 		globalPool.mu.Unlock()
@@ -270,7 +250,7 @@ func (s *subprocess) newThread() *thread {
 // attach attaches to the thread.
 func (t *thread) attach() {
 	if _, _, errno := syscall.RawSyscall6(syscall.SYS_PTRACE, syscall.PTRACE_ATTACH, uintptr(t.tid), 0, 0, 0, 0); errno != 0 {
-		panic(fmt.Sprintf("unable to attach: %v", errno))
+		panic(fmt.Sprintf("unable to attach %d:%d: %v", t.tgid, t.tid, errno))
 	}
 
 	// PTRACE_ATTACH sends SIGSTOP, and wakes the tracee if it was already
@@ -337,6 +317,7 @@ func (t *thread) unexpectedStubExit() {
 		// these cases, we don't need to panic. There is no reasons to
 		// think that something wrong in gVisor.
 		log.Warningf("The ptrace stub process %v has been killed by SIGKILL.", t.tgid)
+		panic("xxx")
 		pid := os.Getpid()
 		syscall.Tgkill(pid, pid, syscall.Signal(syscall.SIGKILL))
 	}
@@ -412,7 +393,7 @@ func (t *thread) init() {
 		syscall.PTRACE_SETOPTIONS,
 		uintptr(t.tid),
 		0,
-		syscall.PTRACE_O_TRACESYSGOOD|syscall.PTRACE_O_TRACEEXIT|PTRACE_O_EXITKILL,
+		syscall.PTRACE_O_TRACESYSGOOD,
 		0, 0)
 	if errno != 0 {
 		panic(fmt.Sprintf("ptrace set options failed: %v", errno))
@@ -600,15 +581,43 @@ func (s *subprocess) switchToApp(c *context, ac arch.Context) bool {
 	}
 }
 
-// syscall executes the given system call without handling interruptions.
-func (s *subprocess) syscall(sysno uintptr, args ...arch.SyscallArgument) (uintptr, error) {
-	// Grab a thread.
+type SyscallRPC struct {
+	sysno uintptr
+	args  []arch.SyscallArgument
+	done  chan SyscallRPCRet
+}
+
+type SyscallRPCRet struct {
+	ret uintptr
+	err error
+}
+
+func (s *subprocess) syscallLoop(c chan SyscallRPC) {
 	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+	//	defer runtime.UnlockOSThread()
+
 	currentTID := int32(procid.Current())
 	t := s.syscallThreads.lookupOrCreate(currentTID, s.newThread)
 
-	return t.syscallIgnoreInterrupt(&t.initRegs, sysno, args...)
+	for req := range c {
+		ret, err := t.syscallIgnoreInterrupt(&t.initRegs, req.sysno, req.args...)
+		req.done <- SyscallRPCRet{ret: ret, err: err}
+	}
+
+	syscall.Kill(int(t.tgid), syscall.SIGKILL)
+}
+
+// syscall executes the given system call without handling interruptions.
+func (s *subprocess) syscall(sysno uintptr, args ...arch.SyscallArgument) (uintptr, error) {
+	// Grab a thread.
+
+	req := SyscallRPC{sysno: sysno, args: args}
+	req.done = make(chan SyscallRPCRet, 1)
+	s.syscallThreads.rpc <- req
+
+	rep := <-req.done
+
+	return rep.ret, rep.err
 }
 
 // MapFile implements platform.AddressSpace.MapFile.

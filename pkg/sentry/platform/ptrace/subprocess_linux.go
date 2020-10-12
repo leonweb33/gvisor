@@ -63,7 +63,7 @@ func createStub() (*thread, error) {
 	//
 	// In addition, we set the PTRACE_O_TRACEEXIT option to log more
 	// information about a stub process when it receives a fatal signal.
-	return attachedThread(uintptr(syscall.SIGKILL)|syscall.CLONE_FILES, defaultAction)
+	return attachedThread(syscall.CLONE_FILES, defaultAction)
 }
 
 // attachedThread returns a new attached thread.
@@ -81,6 +81,7 @@ func attachedThread(flags uintptr, defaultAction linux.BPFAction) (*thread, erro
 				syscall.SYS_CLONE: []seccomp.Rule{
 					// Allow creation of new subprocesses (used by the master).
 					{seccomp.EqualTo(syscall.CLONE_FILES | syscall.SIGKILL)},
+					{seccomp.EqualTo(syscall.CLONE_FILES)},
 					// Allow creation of new threads within a single address space (used by addresss spaces).
 					{seccomp.EqualTo(
 						syscall.CLONE_FILES |
@@ -219,7 +220,7 @@ func (s *subprocess) createStub() (*thread, error) {
 	pid, err := t.syscallIgnoreInterrupt(
 		&regs,
 		syscall.SYS_CLONE,
-		arch.SyscallArgument{Value: uintptr(syscall.SIGKILL | syscall.CLONE_FILES)},
+		arch.SyscallArgument{Value: uintptr(syscall.CLONE_FILES)},
 		arch.SyscallArgument{Value: 0},
 		arch.SyscallArgument{Value: 0},
 		arch.SyscallArgument{Value: 0},

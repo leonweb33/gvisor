@@ -46,9 +46,12 @@ package ptrace
 
 import (
 	"os"
+	"runtime"
+	"syscall"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	pkgcontext "gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/procid"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/platform/interrupt"
@@ -208,6 +211,22 @@ func New() (*PTrace, error) {
 			// Should never happen.
 			panic("unable to initialize ptrace master: " + err.Error())
 		}
+		go func() {
+			runtime.LockOSThread()
+			currentTID := int32(procid.Current())
+			for {
+				t := master.syscallThreads.lookupOrCreate(currentTID, master.newThread)
+				t.syscallIgnoreInterrupt(
+					&t.initRegs,
+					syscall.SYS_WAIT4,
+					arch.SyscallArgument{Value: uintptr(0xffffffffffffffff)},
+					arch.SyscallArgument{Value: 0},
+					arch.SyscallArgument{Value: syscall.WALL},
+					arch.SyscallArgument{Value: 0},
+					arch.SyscallArgument{Value: 0},
+					arch.SyscallArgument{Value: 0})
+			}
+		}()
 
 		// Set the master on the globalPool.
 		globalPool.master = master

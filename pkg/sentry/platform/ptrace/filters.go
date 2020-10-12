@@ -27,6 +27,7 @@ func (*PTrace) SyscallFilters() seccomp.SyscallRules {
 		unix.SYS_GETCPU:    {},
 		syscall.SYS_PTRACE: {},
 		syscall.SYS_TGKILL: {},
+		syscall.SYS_KILL:   {},
 		syscall.SYS_WAIT4:  {},
 	}
 }
