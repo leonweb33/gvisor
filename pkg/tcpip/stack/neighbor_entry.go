@@ -407,8 +407,9 @@ func (e *neighborEntry) handleConfirmationLocked(linkAddr tcpip.LinkAddress, fla
 
 	case Reachable, Stale, Delay, Probe:
 		sameLinkAddr := e.neigh.LinkAddr == linkAddr
+		hasLinkAddr := len(linkAddr) != 0
 
-		if !sameLinkAddr {
+		if !sameLinkAddr && hasLinkAddr {
 			if !flags.Override {
 				if e.neigh.State == Reachable {
 					e.dispatchChangeEventLocked(Stale)
@@ -431,7 +432,7 @@ func (e *neighborEntry) handleConfirmationLocked(linkAddr tcpip.LinkAddress, fla
 			}
 		}
 
-		if flags.Solicited && (flags.Override || sameLinkAddr) {
+		if flags.Solicited && (flags.Override || sameLinkAddr || !hasLinkAddr) {
 			if e.neigh.State != Reachable {
 				e.dispatchChangeEventLocked(Reachable)
 			}
